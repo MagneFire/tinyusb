@@ -455,8 +455,8 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t * 
   } else {
     // skip if endpoint is halted
     TU_VERIFY(!qhd->qtd_overlay.halted);
-    /* H3: one transfer per endpoint at a time; upstream silently replaced a
-     * still-attached TD. The datapath serialises, this makes it visible. */
+    /* H3: one transfer per endpoint at a time, never replace an attached
+     * TD. */
     TU_VERIFY(qhd->attached_qtd == NULL);
 
     qtd = qtd_find_free();
@@ -543,8 +543,7 @@ void async_advance_isr(uint8_t rhport) {
   for (uint32_t i = 0; i < QHD_MAX; i++) {
     if (qhd_pool[i].removing) {
       /* H3: a transfer still attached when the device went away never
-       * completes; upstream left its qTD marked used, leaking one per
-       * unplug until qtd_find_free() failed and every submit with it. */
+       * completes; free its qTD here. */
       ehci_qtd_t * volatile qtd = qhd_pool[i].attached_qtd;
       if (qtd != NULL) {
         qtd->used = 0;
@@ -568,7 +567,7 @@ void port_connect_status_change_isr(uint8_t rhport) {
     /* H3: with CONFIGFLAG set and the OHCI companion present, the HC hands a
      * port to the companion (PortOwner) when a reset ends without the device
      * enabling high speed, which the firmware sees as a disconnect. The host
-     * manager takes the port back after a delay (kernel patch 0012's reclaim). */
+     * manager takes the port back after a delay. */
     ehci_h3_port_handed_over = ehci_data.regs->portsc_bm.port_owner;
     hcd_event_device_remove(rhport, true);
   }

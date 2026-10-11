@@ -153,10 +153,8 @@ static u32 __USBC_Dev_Tx_IsEpStall(void)
 	return USBC_REG_test_bit_w(USBC_BP_TXCSR_D_SENT_STALL, USBC_REG_TXCSR(USBC0_BASE));
 }
 /* H3: a STALL went out. Acknowledge it but keep SEND_STALL: the endpoint
- * stays halted until dcd_edpt_clear_stall() (the host clearing its side of
- * the pipe does not reach us: IOKit's ClearPipeStall is host-only). The
- * upstream sunxi DCD cleared SEND_STALL here, so a halt stalled exactly one
- * transaction and the bridge's halt pulse never kicked macOS adb. */
+ * stays halted until dcd_edpt_clear_stall(). A host that clears only its
+ * own side of the pipe sends nothing that would end the halt. */
 static void __USBC_Dev_Tx_AckSentStall(void)
 {
 	u16 reg_val = USBC_Readw(USBC_REG_TXCSR(USBC0_BASE));
@@ -243,8 +241,7 @@ static u32 __USBC_Dev_Rx_IsReadDataReady(void)
  * already holds the next one. FIFOFULL (both buffers occupied) is sampled
  * before the release because RXPKTRDY takes a few cycles to re-assert for
  * the second packet, and its interrupt flag may have been folded into the
- * one we are servicing: a plain RXPKTRDY check right after the release read
- * 0 and left the packet stranded (OUT flood stalled in loopback). */
+ * one being serviced. */
 static bool rx_more;
 static void __USBC_Dev_Rx_Release(void)
 {
@@ -523,10 +520,8 @@ static bool handle_xfer_in(uint_fast8_t ep_addr)
   if (!(_dcd.in_armed & TU_BIT(epnum_minus1))) return false;
   if (dma_ch[DMA_CHAN_TX].active && dma_ch[DMA_CHAN_TX].ep_addr == ep_addr) return false;
   if (!rem) {
-    /* H3 fix: a zero-length transfer must still put one empty packet on
-     * the wire; upstream returned "complete" without ever setting TXPKTRDY,
-     * so the ZLP never went out and the class driver never got its
-     * completion. Send it now, complete on the TX interrupt. */
+    /* H3: a zero-length transfer still puts one empty packet on the wire.
+     * Send it now, complete on the TX interrupt. */
     if (_dcd.in_zlp_pending & TU_BIT(epnum_minus1)) {
       _dcd.in_zlp_pending &= (uint16_t)~TU_BIT(epnum_minus1);
       __USBC_Dev_Tx_WriteDataComplete();
@@ -538,8 +533,8 @@ static bool handle_xfer_in(uint_fast8_t ep_addr)
   }
 
   /* Never load the FIFO while TXPKTRDY is set (the packet before is still
-   * pending): the write would land on top of a packet waiting to go out. Linux's txstate() has the same guard. The
-   * interrupt that frees the buffer brings us back. */
+   * pending): the write would land on top of a packet waiting to go out.
+   * The interrupt that frees the buffer brings us back. */
   if (USBC_REG_test_bit_w(USBC_BP_TXCSR_D_TX_READY, USBC_REG_TXCSR(USBC0_BASE))) {
     _dcd.tx_busy_irqs++;
     return false;
@@ -856,8 +851,8 @@ static void process_bus_reset(uint8_t rhport)
   /* When pipe0.buf has not NULL, DATA stage works in progress. */
   _dcd.pipe0.buf = NULL;
   /* H3: TinyUSB closes endpoints only on SET_CONFIGURATION, not here, so an
-   * armed inner DMA would survive the reset: still `active`, still aimed
-   * at the old buffer, and blocking the next arm (Codex review). */
+   * armed inner DMA would survive the reset, aimed at the old buffer and
+   * blocking the next arm. */
   for (unsigned ch = 0; ch < TU_ARRAY_SIZE(dma_ch); ch++) if (dma_ch[ch].active) dma_stop(ch);
   memset(_dcd.pipe, 0, sizeof _dcd.pipe);
   _dcd.in_zlp_pending = 0;
@@ -893,8 +888,8 @@ bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
 
   USBC_REG_set_bit_b(USBC_BP_POWER_D_HIGH_SPEED_EN, USBC_REG_PCTL(USBC0_BASE));
 
-  /* No SOF interrupt: at high speed it is 8000 wakeups/s for nothing (the
-   * progress gate reads FRNUM itself); console `sofirq 1` turns it on. */
+  /* No SOF interrupt by default; dcd_sof_enable() or dcd_h3_sof_irq()
+   * turns it on. */
   USBC_Writeb((1 << USBC_BP_INTUSBE_EN_SUSPEND)
     | (1 << USBC_BP_INTUSBE_EN_RESUME)
     | (1 << USBC_BP_INTUSBE_EN_RESET)
@@ -1018,12 +1013,8 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc)
     /* [ep][0=OUT/RX, 1=IN/TX] */
     { {0, 3, 0},      {0, 3, 0}    },   /* ep0: fixed 64 */
     /* ep1 adb: RX double-buffered, TX single. PIO loads into a
-     * double-buffered TX FIFO lost their first 16 words about once per
-     * 2000 packets while the RX side was busy (concurrent push+pull): the
-     * packet went out with the other buffer's old first 64 bytes. Never
-     * with the inner DMA loading the FIFO, never single-buffered.
-     * Linux keeps the sunxi FIFOs single-buffered too. DPB gave no
-     * throughput anyway (M3). */
+     * double-buffered TX FIFO can lose their first words while the RX side
+     * is busy. */
     { {2048, 6, 1},   {1024, 6, 0} },
     { {3584, 6, 0},   {3072, 6, 0} },   /* ep2 fastboot */
     { {0, 0, 0},      {64, 3, 0}   },   /* ep3 CDC notify (IN only, 64) */
