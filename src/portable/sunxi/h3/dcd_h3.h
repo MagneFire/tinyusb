@@ -26,7 +26,7 @@ void dcd_h3_board_init(void);
 // Unmask or mask the musb interrupt at the interrupt controller.
 void dcd_h3_board_int_enable(bool enable);
 
-// Free-running microsecond counter.
+// Free-running microsecond counter, for the TX DMA drain timeout.
 uint32_t dcd_h3_board_time_us(void);
 
 // Buffers are cleaned and invalidated through dcd_dcache_clean() and
@@ -47,10 +47,13 @@ uint32_t dcd_h3_dma_enabled(void);
 // SOF interrupt on or off.
 void dcd_h3_sof_irq(bool on);
 
+// RX packets drained behind the first (DPB), TX interrupts with TXPKTRDY
+// still set.
 void dcd_h3_dpb_stats(uint32_t *rx_extra, uint32_t *tx_busy);
-void dcd_h3_fifo_stats(uint32_t *rd_us_x10, uint32_t *rd_n, uint32_t *wr_us_x10, uint32_t *wr_n);
-void dcd_h3_gap_stats(uint32_t **rx, uint32_t **tx);
-void dcd_h3_dma_stats(uint32_t *rx, uint32_t *tx, uint32_t *rx_short, uint32_t *tx_spin_us, uint32_t *bad);
+
+// DMA transfers per direction, RX transfers ended by a short packet, and
+// residual counts larger than the transfer.
+void dcd_h3_dma_stats(uint32_t *rx, uint32_t *tx, uint32_t *rx_short, uint32_t *bad);
 
 #ifdef __cplusplus
 }

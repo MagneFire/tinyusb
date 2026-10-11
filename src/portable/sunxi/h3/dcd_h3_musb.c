@@ -63,7 +63,6 @@ typedef struct
   pipe_state_t pipe0;
   pipe_state_t pipe[2][7];   /* pipe[direction][endpoint number - 1] */
   uint32_t     dpb_rx_extra, tx_busy_irqs; /* H3: packets drained behind the first (RX DPB), TX interrupts with TXPKTRDY still set */
-  uint32_t     fifo_rd_us, fifo_rd_n, fifo_wr_us, fifo_wr_n;            /* PIO copy cost, packets >= 256 B */
   uint16_t     in_zlp_pending;      /* H3: bitmap, a zero-length IN transfer still to be sent */
   uint16_t     rx_held;             /* H3: bitmap, the OUT packet in the FIFO was read (back-pressure) */
   uint16_t     in_armed;            /* H3: bitmap, an IN transfer is in progress */
@@ -387,24 +386,13 @@ static void process_setup_packet(uint8_t rhport)
 
 struct h3_dma { bool active; bool tx; uint8_t ep_addr; uint32_t len; };
 static struct h3_dma dma_ch[2];
-static uint32_t dma_rx_n, dma_tx_n, dma_rx_short, dma_tx_spin_us, dma_bad_resid;
-/* inter-packet gap histograms on the adb pair (us): <12, <20, <30, <50, <100, >=100 */
-static uint32_t gap_rx[6], gap_tx[6], gap_rx_last, gap_tx_last;
-static void gap_note(uint32_t *h, uint32_t *last, uint32_t now, bool first)
-{
-  if (!first && *last) {
-    uint32_t g = now - *last;
-    h[g < 12 ? 0 : g < 20 ? 1 : g < 30 ? 2 : g < 50 ? 3 : g < 100 ? 4 : 5]++;
-  }
-  *last = now;
-}
-void dcd_h3_gap_stats(uint32_t **rx, uint32_t **tx) { *rx = gap_rx; *tx = gap_tx; }
+static uint32_t dma_rx_n, dma_tx_n, dma_rx_short, dma_bad_resid;
 static uint32_t dma_mask = 1;		/* bit0: RX (Mac->gadget) DMA, bit1: TX DMA; console `dma` */
 void dcd_h3_dma_enable(uint32_t mask) { dma_mask = mask & 3; }
 uint32_t dcd_h3_dma_enabled(void) { return dma_mask; }
-void dcd_h3_dma_stats(uint32_t *rx, uint32_t *tx, uint32_t *rx_short, uint32_t *tx_spin_us, uint32_t *bad)
+void dcd_h3_dma_stats(uint32_t *rx, uint32_t *tx, uint32_t *rx_short, uint32_t *bad)
 {
-  *rx = dma_rx_n; *tx = dma_tx_n; *rx_short = dma_rx_short; *tx_spin_us = dma_tx_spin_us; *bad = dma_bad_resid;
+  *rx = dma_rx_n; *tx = dma_tx_n; *rx_short = dma_rx_short; *bad = dma_bad_resid;
 }
 
 /* high-byte RMW of the CSRs, as the vendor does: the low byte holds the
@@ -504,7 +492,6 @@ static void handle_dma_done(uint8_t rhport, unsigned ch)
     uint32_t t0 = dcd_h3_board_time_us();
     while (USBC_REG_test_bit_w(USBC_BP_TXCSR_D_FIFO_NOT_EMPTY, USBC_REG_TXCSR(USBC0_BASE)) && dcd_h3_board_time_us() - t0 < 400)
       ;
-    dma_tx_spin_us += dcd_h3_board_time_us() - t0;
     tx_dma_csr_off();
   } else {
     rx_dma_csr_off();
@@ -562,10 +549,7 @@ static bool handle_xfer_in(uint_fast8_t ep_addr)
   uint8_t          *buf = pipe->buf;
   if (len) {
     volatile void* addr = (volatile void*)(USBC_REG_EPFIFO1(USBC0_BASE) + (epnum_minus1 << 2));
-    uint32_t t0 = dcd_h3_board_time_us();
-    if (epnum_minus1 == 0 && len >= 256) gap_note(gap_tx, &gap_tx_last, t0, rem == pipe->length);
     pipe_write_packet(buf, addr, len);
-    if (len >= 256) { _dcd.fifo_wr_us += dcd_h3_board_time_us() - t0; _dcd.fifo_wr_n++; }
     pipe->buf       = buf + len;
     pipe->remaining = rem - len;
   }
@@ -602,10 +586,7 @@ static bool handle_xfer_out(uint_fast8_t ep_addr)
   uint8_t          *buf = pipe->buf;
   if (len) {
     volatile void* addr = (volatile void*)(USBC_REG_EPFIFO1(USBC0_BASE) + (epnum_minus1 << 2));
-    uint32_t t0 = dcd_h3_board_time_us();
-    if (epnum_minus1 == 0 && len >= 256) gap_note(gap_rx, &gap_rx_last, t0, rem == pipe->length);
     pipe_read_packet(buf, addr, len);
-    if (len >= 256) { _dcd.fifo_rd_us += dcd_h3_board_time_us() - t0; _dcd.fifo_rd_n++; }
     pipe->buf       = buf + len;
     pipe->remaining = rem - len;
   }
@@ -897,14 +878,6 @@ void dcd_h3_dpb_stats(uint32_t *rx_extra, uint32_t *tx_busy)
 {
   *rx_extra = _dcd.dpb_rx_extra; *tx_busy = _dcd.tx_busy_irqs;
 }
-/* mean us per >=256-byte packet copied from / to the FIFO by PIO */
-void dcd_h3_fifo_stats(uint32_t *rd_us_x10, uint32_t *rd_n, uint32_t *wr_us_x10, uint32_t *wr_n)
-{
-  *rd_n = _dcd.fifo_rd_n; *wr_n = _dcd.fifo_wr_n;
-  *rd_us_x10 = _dcd.fifo_rd_n ? _dcd.fifo_rd_us * 10 / _dcd.fifo_rd_n : 0;
-  *wr_us_x10 = _dcd.fifo_wr_n ? _dcd.fifo_wr_us * 10 / _dcd.fifo_wr_n : 0;
-}
-
 bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
   (void) rh_init;
 
