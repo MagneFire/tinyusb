@@ -52,9 +52,6 @@ volatile int ehci_h3_port_handed_over;
 // MACRO CONSTANT TYPEDEF
 //--------------------------------------------------------------------+
 
-// Debug level of EHCI
-#define EHCI_DBG     2
-
 // Framelist size as small as possible to save SRAM: 256 elements
 #define FRAMELIST_SIZE_BIT_VALUE      2u
 #define FRAMELIST_SIZE_USBCMD_VALUE   ((FRAMELIST_SIZE_BIT_VALUE &  3) << EHCI_USBCMD_FRAMELIST_SIZE_SHIFT)
@@ -92,47 +89,8 @@ typedef struct {
 CFG_TUH_MEM_SECTION TU_ATTR_ALIGNED(4096) static ehci_data_t ehci_data;
 
 //--------------------------------------------------------------------+
-// Debug
-//--------------------------------------------------------------------+
-#if 0 && CFG_TUSB_DEBUG >= (EHCI_DBG + 1)
-static inline void print_portsc(ehci_registers_t* regs) {
-  TU_LOG_HEX(EHCI_DBG, regs->portsc);
-  TU_LOG(EHCI_DBG, "  Connect Status : %u\r\n", regs->portsc_bm.current_connect_status);
-  TU_LOG(EHCI_DBG, "  Connect Change : %u\r\n", regs->portsc_bm.connect_status_change);
-  TU_LOG(EHCI_DBG, "  Enabled        : %u\r\n", regs->portsc_bm.port_enabled);
-  TU_LOG(EHCI_DBG, "  Enabled Change : %u\r\n", regs->portsc_bm.port_enable_change);
-
-  TU_LOG(EHCI_DBG, "  OverCurr Change: %u\r\n", regs->portsc_bm.over_current_change);
-  TU_LOG(EHCI_DBG, "  Force Resume   : %u\r\n", regs->portsc_bm.force_port_resume);
-  TU_LOG(EHCI_DBG, "  Suspend        : %u\r\n", regs->portsc_bm.suspend);
-  TU_LOG(EHCI_DBG, "  Reset          : %u\r\n", regs->portsc_bm.port_reset);
-  TU_LOG(EHCI_DBG, "  Power          : %u\r\n", regs->portsc_bm.port_power);
-}
-
-static inline void print_intr(uint32_t intr) {
-  TU_LOG_HEX(EHCI_DBG, intr);
-  TU_LOG(EHCI_DBG, "  USB Interrupt      : %u\r\n", (intr & EHCI_INT_MASK_USB) ? 1 : 0);
-  TU_LOG(EHCI_DBG, "  USB Error          : %u\r\n", (intr & EHCI_INT_MASK_ERROR) ? 1 : 0);
-  TU_LOG(EHCI_DBG, "  Port Change Detect : %u\r\n", (intr & EHCI_INT_MASK_PORT_CHANGE) ? 1 : 0);
-  TU_LOG(EHCI_DBG, "  Frame List Rollover: %u\r\n", (intr & EHCI_INT_MASK_FRAMELIST_ROLLOVER) ? 1 : 0);
-  TU_LOG(EHCI_DBG, "  Host System Error  : %u\r\n", (intr & EHCI_INT_MASK_PCI_HOST_SYSTEM_ERROR) ? 1 : 0);
-  TU_LOG(EHCI_DBG, "  Async Advance      : %u\r\n", (intr & EHCI_INT_MASK_ASYNC_ADVANCE) ? 1 : 0);
-//  TU_LOG(EHCI_DBG, "  Interrupt on Async: %u\r\n", (intr & EHCI_INT_MASK_NXP_ASYNC));
-//  TU_LOG(EHCI_DBG, "  Periodic Schedule : %u\r\n", (intr & EHCI_INT_MASK_NXP_PERIODIC));
-}
-
-#else
-#define print_portsc(_reg)
-#endif
-
-//--------------------------------------------------------------------+
 // PROTOTYPE
 //--------------------------------------------------------------------+
-
-// weak dcache for non-cacheable MCU
-TU_ATTR_WEAK bool hcd_dcache_clean(void const* addr, uint32_t data_size) { (void) addr; (void) data_size; return true; }
-TU_ATTR_WEAK bool hcd_dcache_invalidate(void const* addr, uint32_t data_size) { (void) addr; (void) data_size; return true; }
-TU_ATTR_WEAK bool hcd_dcache_clean_invalidate(void const* addr, uint32_t data_size) { (void) addr; (void) data_size; return true; }
 
 TU_ATTR_ALWAYS_INLINE static inline ehci_qhd_t* qhd_control(uint8_t dev_addr);
 TU_ATTR_ALWAYS_INLINE static inline ehci_qhd_t* qhd_next (ehci_qhd_t const * p_qhd);
@@ -333,7 +291,7 @@ bool ehci_init(uint8_t rhport, uint32_t capability_reg, uint32_t operatial_reg)
   async_head->next.type                  = EHCI_QTYPE_QHD;
   async_head->head_list_flag             = 1;
   async_head->qtd_overlay.halted         = 1; // inactive most of time
-  async_head->qtd_overlay.next.terminate = 1; // TODO removed if verified
+  async_head->qtd_overlay.next.terminate = 1;
 
   regs->async_list_addr = (uint32_t) async_head;
 
@@ -342,8 +300,6 @@ bool ehci_init(uint8_t rhport, uint32_t capability_reg, uint32_t operatial_reg)
   regs->periodic_list_base = (uint32_t) ehci_data.period_framelist;
 
   hcd_dcache_clean(&ehci_data, sizeof(ehci_data_t));
-
-  /* H3: no NXP TT control register. */
 
   //------------- USB CMD Register -------------//
   regs->command |= EHCI_USBCMD_RUN_STOP | EHCI_USBCMD_PERIOD_SCHEDULE_ENABLE | EHCI_USBCMD_ASYNC_SCHEDULE_ENABLE |
@@ -443,7 +399,7 @@ bool hcd_edpt_close(uint8_t rhport, uint8_t daddr, uint8_t ep_addr) {
   ehci_link_t * list_head;
   if (qhd_is_periodic(qhd)) {
     // interrupt endpoint
-    list_head = list_get_period_head(rhport, qhd->interval_ms);;
+    list_head = list_get_period_head(rhport, qhd->interval_ms);
   } else {
     list_head = (ehci_link_t *) list_get_async_head(rhport);
   }
@@ -641,7 +597,6 @@ void qhd_xfer_complete_isr(ehci_qhd_t * qhd) {
         xfer_result = XFER_RESULT_FAILED;
         qtd_overlay->halted = false;
         TU_LOG3("  QHD xfer err count: %d\r\n", qtd_overlay->err_count);
-        // TU_BREAKPOINT(); // TODO skip unplugged device
       }else {
         // no error bits are set, endpoint is halted due to STALL
         xfer_result = XFER_RESULT_STALLED;
@@ -650,8 +605,7 @@ void qhd_xfer_complete_isr(ehci_qhd_t * qhd) {
       xfer_result = XFER_RESULT_SUCCESS;
     }
 
-    ehci_qtd_t * volatile qtd = qhd->attached_qtd;
-    hcd_dcache_invalidate(qtd, sizeof(ehci_qtd_t)); // HC may have written back TD
+    ehci_qtd_t * volatile qtd = attached;
 
     uint8_t const dir = (qtd->pid == EHCI_PID_IN) ? 1 : 0;
     uint32_t const xferred_bytes = qtd->expected_bytes - qtd->total_bytes;
@@ -784,7 +738,6 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
   if (int_status & EHCI_INT_MASK_PORT_CHANGE) {
     // Including: Force port resume, over-current change, enable/disable change and connect status change.
     uint32_t const port_status = regs->portsc & EHCI_PORTSC_MASK_W1C;
-    // print_portsc(regs);
 
     if (regs->portsc_bm.connect_status_change) {
       port_connect_status_change_isr(rhport);
@@ -799,10 +752,8 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
   if (usb_int) {
     proccess_async_xfer_isr(list_get_async_head(rhport));
 
-    /* H3: there are only four periodic heads (1/2/4/8 ms); upstream iterated
-     * up to FRAMELIST_SIZE, which with a standard 256-entry frame list indexes
-     * past period_head_arr[] and walks garbage forever (NXP's 8-entry list
-     * never reached it). */
+    /* H3: walk the four periodic heads (1/2/4/8 ms) only; up to
+     * FRAMELIST_SIZE would index past period_head_arr[]. */
     for ( uint32_t i = 1; i <= 8; i *= 2 ) {
       process_period_xfer_isr(rhport, i);
     }
@@ -811,7 +762,6 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
   }
 
   //------------- There is some removed async previously -------------//
-  // need to place after EHCI_INT_MASK_NXP_ASYNC
   if (int_status & EHCI_INT_MASK_ASYNC_ADVANCE) {
     async_advance_isr(rhport);
     regs->status = EHCI_INT_MASK_ASYNC_ADVANCE; // Acknowledge
