@@ -34,7 +34,7 @@
 #include <stdint.h>
 #include "tusb_option.h"
 
-#if CFG_TUD_ENABLED && CFG_TUSB_MCU == OPT_MCU_NONE   /* H3 fork */
+#if CFG_TUD_ENABLED
 
 #include "osal/osal.h"
 #include <device/dcd.h>
@@ -62,7 +62,6 @@ typedef struct
   int8_t       status_out;
   pipe_state_t pipe0;
   pipe_state_t pipe[2][7];   /* pipe[direction][endpoint number - 1] */
-  uint16_t     pipe_buf_is_fifo[2]; /* Bitmap. Each bit means whether 1:TU_FIFO or 0:POD. */
   uint32_t     dpb_rx_extra, tx_busy_irqs; /* H3: packets drained behind the first (RX DPB), TX interrupts with TXPKTRDY still set */
   uint32_t     fifo_rd_us, fifo_rd_n, fifo_wr_us, fifo_wr_n;            /* PIO copy cost, packets >= 256 B */
   uint16_t     in_zlp_pending;      /* H3: bitmap, a zero-length IN transfer still to be sent */
@@ -117,32 +116,6 @@ static void USBC_ForceVbusValidToHigh(void)
 	reg_val |= (0x03 << USBC_BP_ISCR_FORCE_VBUS_VALID);
 	reg_val = USBC_WakeUp_ClearChangeDetect(reg_val);
 	USBC_Writel(reg_val, USBC_REG_ISCR(USBC0_BASE));
-}
-
-static void USBC_SelectBus(u32 io_type, u32 ep_type, u32 ep_index)
-{
-	u32 reg_val = 0;
-
-	reg_val = USBC_Readb(USBC_REG_VEND0(USBC0_BASE));
-	if (io_type == USBC_IO_TYPE_DMA) {
-		if (ep_type == USBC_EP_TYPE_TX) {
-			reg_val |= ((ep_index - 0x01) << 1) << USBC_BP_VEND0_DRQ_SEL;  //drq_sel
-			reg_val |= 0x1<<USBC_BP_VEND0_BUS_SEL;   //io_dma
-		} else {
-			reg_val |= ((ep_index << 1) - 0x01) << USBC_BP_VEND0_DRQ_SEL;
-			reg_val |= 0x1<<USBC_BP_VEND0_BUS_SEL;
-		}
-	} else {
-		//reg_val &= ~(0x1 << USBC_BP_VEND0_DRQ_SEL);  //clear drq_sel, select pio
-		reg_val &= 0x00;  // clear drq_sel, select pio
-	}
-
-	/* in 1667 1673 and later ic, FIFO_BUS_SEL bit(bit24 of reg0x40 for host/device)
-	 * is fixed to 1, the hw guarantee that it's ok for cpu/inner_dma/outer_dma transfer */
-
-//	reg_val |= 0x1<<USBC_BP_VEND0_BUS_SEL;  //for 1663 set 1: enable dma, set 0: enable fifo
-
-	USBC_Writeb(reg_val, USBC_REG_VEND0(USBC0_BASE));
 }
 
 static void USBC_SelectActiveEp(u8 ep_index)
@@ -314,6 +287,13 @@ static void USBC_INT_DisableRxEp(u8 ep_index)
 
 CFG_TUD_MEM_ALIGN static dcd_data_t _dcd;
 
+static void pipe0_reset(void)
+{
+  _dcd.pipe0.buf       = NULL;
+  _dcd.pipe0.length    = 0;
+  _dcd.pipe0.remaining = 0;
+}
+
 static void pipe_write_packet(void *buff, volatile void *fifo, unsigned cnt)
 {
  	u32 len = 0;
@@ -368,30 +348,6 @@ static void pipe_read_packet(void *buff, volatile void *fifo, unsigned cnt)
 	}
 }
 
-static void pipe_read_write_packet_ff(tu_fifo_t *f, volatile void *fifo, unsigned len, unsigned dir)
-{
-  static const struct {
-    void (*tu_fifo_get_info)(tu_fifo_t *f, tu_fifo_buffer_info_t *info);
-    void (*tu_fifo_advance)(tu_fifo_t *f, uint16_t n);
-    void (*pipe_read_write)(void *buf, volatile void *fifo, unsigned len);
-  } ops[] = {
-    /* OUT */ {tu_fifo_get_write_info,tu_fifo_advance_write_pointer,pipe_read_packet},
-    /* IN  */ {tu_fifo_get_read_info, tu_fifo_advance_read_pointer, pipe_write_packet},
-  };
-  tu_fifo_buffer_info_t info;
-  ops[dir].tu_fifo_get_info(f, &info);
-  unsigned total_len = len;
-  len = TU_MIN(total_len, info.linear.len);
-  ops[dir].pipe_read_write(info.linear.ptr, fifo, len);
-  unsigned rem = total_len - len;
-  if (rem) {
-    len = TU_MIN(rem, info.wrapped.len);
-    ops[dir].pipe_read_write(info.wrapped.ptr, fifo, len);
-    rem -= len;
-  }
-  ops[dir].tu_fifo_advance(f, total_len - rem);
-}
-
 /*------------------------------------------------------------------
  * TRANSFER FUNCTION DECLARATION
  *------------------------------------------------------------------*/
@@ -402,9 +358,7 @@ static void process_setup_packet(uint8_t rhport)
   p[0]        = USBC_Readl(USBC_REG_EPFIFO0(USBC0_BASE));
   p[1]        = USBC_Readl(USBC_REG_EPFIFO0(USBC0_BASE));
 
-  _dcd.pipe0.buf       = NULL;
-  _dcd.pipe0.length    = 0;
-  _dcd.pipe0.remaining = 0;
+  pipe0_reset();
   dcd_event_setup_received(rhport, (const uint8_t*)(uintptr_t)&_dcd.setup_packet, true);
 
   const unsigned len    = _dcd.setup_packet.wLength;
@@ -606,34 +560,23 @@ static bool handle_xfer_in(uint_fast8_t ep_addr)
   const unsigned mps = USBC_Readw(USBC_REG_TXMAXP(USBC0_BASE));
   const unsigned len = TU_MIN(mps, rem);
   uint8_t          *buf = pipe->buf;
-  // TU_LOG1("   %p mps %d len %d rem %d\r\n", buf, mps, len, rem);
   if (len) {
     volatile void* addr = (volatile void*)(USBC_REG_EPFIFO1(USBC0_BASE) + (epnum_minus1 << 2));
-    if (_dcd.pipe_buf_is_fifo[TUSB_DIR_IN] & TU_BIT(epnum_minus1)) {
-      pipe_read_write_packet_ff((tu_fifo_t *)(uintptr_t) buf, addr, len, TUSB_DIR_IN);
-    } else {
-      uint32_t t0 = dcd_h3_board_time_us();
-      if (epnum_minus1 == 0 && len >= 256) gap_note(gap_tx, &gap_tx_last, t0, rem == pipe->length);
-      pipe_write_packet(buf, addr, len);
-      if (len >= 256) { _dcd.fifo_wr_us += dcd_h3_board_time_us() - t0; _dcd.fifo_wr_n++; }
-      pipe->buf       = buf + len;
-    }
+    uint32_t t0 = dcd_h3_board_time_us();
+    if (epnum_minus1 == 0 && len >= 256) gap_note(gap_tx, &gap_tx_last, t0, rem == pipe->length);
+    pipe_write_packet(buf, addr, len);
+    if (len >= 256) { _dcd.fifo_wr_us += dcd_h3_board_time_us() - t0; _dcd.fifo_wr_n++; }
+    pipe->buf       = buf + len;
     pipe->remaining = rem - len;
   }
   __USBC_Dev_Tx_WriteDataComplete();
   return false;
 }
 
-
-/* H3: per-packet progress of an OUT transfer, for cut-through forwarding
- * (gadget_slots.c). ISR context. */
-TU_ATTR_WEAK void dcd_h3_out_progress(uint8_t ep_addr, uint32_t received) { (void)ep_addr; (void)received; }
-
 static bool handle_xfer_out(uint_fast8_t ep_addr)
 {
   unsigned epnum_minus1 = tu_edpt_number(ep_addr) - 1;
   pipe_state_t  *pipe = &_dcd.pipe[tu_edpt_dir(ep_addr)][epnum_minus1];
-  // TU_LOG1(" RXCSRL%d = %x\r\n", epnum_minus1 + 1, regs->RXCSRL);
 
   TU_ASSERT(__USBC_Dev_Rx_IsReadDataReady());
   /* Nothing armed: the packet waits in the FIFO for the next transfer. A
@@ -659,18 +602,12 @@ static bool handle_xfer_out(uint_fast8_t ep_addr)
   uint8_t          *buf = pipe->buf;
   if (len) {
     volatile void* addr = (volatile void*)(USBC_REG_EPFIFO1(USBC0_BASE) + (epnum_minus1 << 2));
-    if (_dcd.pipe_buf_is_fifo[TUSB_DIR_OUT] & TU_BIT(epnum_minus1)) {
-      pipe_read_write_packet_ff((tu_fifo_t *)(uintptr_t )buf, addr, len, TUSB_DIR_OUT);
-    } else {
-      uint32_t t0 = dcd_h3_board_time_us();
-      if (epnum_minus1 == 0 && len >= 256) gap_note(gap_rx, &gap_rx_last, t0, rem == pipe->length);
-      pipe_read_packet(buf, addr, len);
-      if (len >= 256) { _dcd.fifo_rd_us += dcd_h3_board_time_us() - t0; _dcd.fifo_rd_n++; }
-      pipe->buf       = buf + len;
-    }
+    uint32_t t0 = dcd_h3_board_time_us();
+    if (epnum_minus1 == 0 && len >= 256) gap_note(gap_rx, &gap_rx_last, t0, rem == pipe->length);
+    pipe_read_packet(buf, addr, len);
+    if (len >= 256) { _dcd.fifo_rd_us += dcd_h3_board_time_us() - t0; _dcd.fifo_rd_n++; }
+    pipe->buf       = buf + len;
     pipe->remaining = rem - len;
-    if (!(_dcd.pipe_buf_is_fifo[TUSB_DIR_OUT] & TU_BIT(epnum_minus1)))
-      dcd_h3_out_progress(ep_addr, pipe->length - pipe->remaining);
   }
   if ((len < mps) || (rem == len)) {
     /* the packet stays in the FIFO as back-pressure until the next arm */
@@ -680,6 +617,19 @@ static bool handle_xfer_out(uint_fast8_t ep_addr)
   }
   __USBC_Dev_Rx_Release();
   return false;
+}
+
+/* H3 DPB: the other buffer may hold the next packet already and its
+ * interrupt was folded into the one just serviced. Only while a transfer is
+ * armed: with none, RXPKTRDY stays set on purpose (back-pressure). */
+static bool rx_drain(uint_fast8_t ep_addr, bool completed)
+{
+  pipe_state_t *pipe = &_dcd.pipe[TUSB_DIR_OUT][tu_edpt_number(ep_addr) - 1];
+  while (!completed && pipe->buf && rx_more) {
+    _dcd.dpb_rx_extra++;
+    completed = handle_xfer_out(ep_addr);
+  }
+  return completed;
 }
 
 static bool edpt_n_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t total_bytes)
@@ -726,11 +676,7 @@ static bool edpt_n_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16
          * read). It is this transfer's first. */
         completed = handle_xfer_out(ep_addr);
       }
-      while (!completed && pipe->buf && rx_more) {
-        _dcd.dpb_rx_extra++;
-        completed = handle_xfer_out(ep_addr);
-      }
-      if (completed) {
+      if (rx_drain(ep_addr, completed)) {
         dcd_event_xfer_complete(rhport, ep_addr, pipe->length - pipe->remaining, XFER_RESULT_SUCCESS, false);
         return true;
       }
@@ -765,7 +711,6 @@ static bool edpt0_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_
      * may have already finished and received the next setup packet
      * without calling this function, so we have no choice but to
      * invoke the callback function of status packet here. */
-    // TU_LOG1(" STATUS OUT CSRL0 = %x\r\n", CSRL0);
     _dcd.status_out = 0;
     if (req == REQUEST_TYPE_INVALID) {
       dcd_event_xfer_complete(rhport, ep_addr, total_bytes, XFER_RESULT_SUCCESS, false);
@@ -797,19 +742,14 @@ static bool edpt0_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_
       } else {
         __USBC_Dev_ep0_WriteDataHalf();
       }
-      // TU_LOG1(" IN CSRL0 = %x\r\n", CSRL0);
     } else {
-      // TU_LOG1(" OUT CSRL0 = %x\r\n", CSRL0);
       _dcd.pipe0.buf       = buffer;
       _dcd.pipe0.length    = len;
       _dcd.pipe0.remaining = len;
       __USBC_Dev_ep0_ReadDataHalf();
     }
   } else if (dir_in) {
-    // TU_LOG1(" STATUS IN CSRL0 = %x\r\n", CSRL0);
-    _dcd.pipe0.buf = NULL;
-    _dcd.pipe0.length    = 0;
-    _dcd.pipe0.remaining = 0;
+    pipe0_reset();
     /* Clear RX FIFO and reverse the transaction direction */
     __USBC_Dev_ep0_ReadDataComplete();
   }
@@ -821,7 +761,6 @@ static void process_ep0(uint8_t rhport)
   USBC_SelectActiveEp(0);
   uint_fast8_t csrl = USBC_Readw(USBC_REG_CSR0(USBC0_BASE));
 
-  // TU_LOG1(" EP0 CSRL0 = %x\r\n", csrl);
 
   if (csrl & USB_CSRL0_STALLED) {
     /* Returned STALL packet to HOST. */
@@ -831,7 +770,6 @@ static void process_ep0(uint8_t rhport)
 
   unsigned req = _dcd.setup_packet.bmRequestType;
   if (csrl & USB_CSRL0_SETEND) {
-    // TU_LOG1("   ABORT by the next packets\r\n");
     USBC_Dev_Ctrl_ClearSetupEnd();
     if (req != REQUEST_TYPE_INVALID && _dcd.pipe0.buf) {
       /* DATA stage was aborted by receiving STATUS or SETUP packet. */
@@ -907,31 +845,21 @@ static void process_edpt_n(uint8_t rhport, uint_fast8_t ep_addr)
   USBC_SelectActiveEp(epn);
 
   if (dir_in) {
-    // TU_LOG1(" TXCSRL%d = %x\r\n", epn_minus1 + 1, regs->TXCSRL);
     if (__USBC_Dev_Tx_IsEpStall()) {
       __USBC_Dev_Tx_AckSentStall();
       return;
     }
     completed = handle_xfer_in(ep_addr);
   } else {
-    // TU_LOG1(" RXCSRL%d = %x\r\n", epn_minus1 + 1, regs->RXCSRL);
     if (__USBC_Dev_Rx_IsEpStall()) {
       __USBC_Dev_Rx_AckSentStall();
       return;
     }
-    /* H3 DPB: the other buffer may hold the next packet already and its
-     * interrupt was folded into this one; drain while RXPKTRDY re-asserts. */
-    completed = handle_xfer_out(ep_addr);
-    /* Only while a transfer is armed: with none, RXPKTRDY stays set on
-     * purpose (back-pressure) and this loop would never end. */
-    while (!completed && _dcd.pipe[TUSB_DIR_OUT][epn - 1].buf && rx_more) {
-      _dcd.dpb_rx_extra++;
-      completed = handle_xfer_out(ep_addr);
-    }
+    completed = rx_drain(ep_addr, handle_xfer_out(ep_addr));
   }
 
   if (completed) {
-    pipe_state_t *pipe = &_dcd.pipe[dir_in][tu_edpt_number(ep_addr) - 1];
+    pipe_state_t *pipe = &_dcd.pipe[dir_in][epn - 1];
     dcd_event_xfer_complete(rhport, ep_addr,
                             pipe->length - pipe->remaining,
                             XFER_RESULT_SUCCESS, true);
@@ -949,7 +877,7 @@ static void process_bus_reset(uint8_t rhport)
   /* H3: TinyUSB closes endpoints only on SET_CONFIGURATION, not here, so an
    * armed inner DMA would survive the reset: still `active`, still aimed
    * at the old buffer, and blocking the next arm (Codex review). */
-  for (unsigned ch = 0; ch < 2; ch++) if (dma_ch[ch].active) dma_stop(ch);
+  for (unsigned ch = 0; ch < TU_ARRAY_SIZE(dma_ch); ch++) if (dma_ch[ch].active) dma_stop(ch);
   memset(_dcd.pipe, 0, sizeof _dcd.pipe);
   _dcd.in_zlp_pending = 0;
   _dcd.rx_held = 0;
@@ -987,14 +915,10 @@ bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
   USBC_EnableDpDmPullUp();
   USBC_ForceIdToHigh(); // Force device mode
   USBC_ForceVbusValidToHigh();
-  USBC_SelectBus(USBC_IO_TYPE_PIO, 0, 0);
+  USBC_Writeb(0, USBC_REG_VEND0(USBC0_BASE)); /* PIO, no DMA request */
   dcd_edpt_close_all(rhport);
 
-  #if TUD_OPT_HIGH_SPEED
-    USBC_REG_set_bit_b(USBC_BP_POWER_D_HIGH_SPEED_EN, USBC_REG_PCTL(USBC0_BASE));
-  #else
-    USBC_REG_clear_bit_b(USBC_BP_POWER_D_HIGH_SPEED_EN, USBC_REG_PCTL(USBC0_BASE));
-  #endif
+  USBC_REG_set_bit_b(USBC_BP_POWER_D_HIGH_SPEED_EN, USBC_REG_PCTL(USBC0_BASE));
 
   /* No SOF interrupt: at high speed it is 8000 wakeups/s for nothing (the
    * progress gate reads FRNUM itself); console `sofirq 1` turns it on. */
@@ -1040,20 +964,10 @@ void dcd_int_enable(uint8_t rhport)
   dcd_h3_board_int_enable(true);
 }
 
-static void musb_int_mask(void)
-{
-  dcd_h3_board_int_enable(false);
-}
-
 void dcd_int_disable(uint8_t rhport)
 {
   (void)rhport;
   dcd_h3_board_int_enable(false);
-}
-
-static void musb_int_unmask(void)
-{
-  dcd_h3_board_int_enable(true);
 }
 
 // Receive Set Address request, mcu port must also include status IN response
@@ -1061,9 +975,7 @@ void dcd_set_address(uint8_t rhport, uint8_t dev_addr)
 {
   (void)rhport;
   (void)dev_addr;
-  _dcd.pipe0.buf       = NULL;
-  _dcd.pipe0.length    = 0;
-  _dcd.pipe0.remaining = 0;
+  pipe0_reset();
   /* Clear RX FIFO to return ACK. */
   USBC_SelectActiveEp(0);
   __USBC_Dev_ep0_ReadDataComplete();
@@ -1082,10 +994,6 @@ void dcd_remote_wakeup(uint8_t rhport)
 // Endpoint API
 //--------------------------------------------------------------------+
 
-#ifndef __ARMCC_VERSION
-#define __clz __builtin_clz
-#endif
-
 // Configure endpoint's registers according to descriptor
 bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc)
 {
@@ -1096,7 +1004,6 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc)
   const unsigned ep_addr = ep_desc->bEndpointAddress;
   const unsigned epn     = tu_edpt_number(ep_addr);
   const unsigned dir_in  = tu_edpt_dir(ep_addr);
-  const unsigned xfer    = ep_desc->bmAttributes.xfer;
   const unsigned mps     = tu_edpt_packet_size(ep_desc);
 
   TU_ASSERT(epn < TUP_DCD_ENDPOINT_MAX);
@@ -1106,9 +1013,8 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc)
   pipe->length    = 0;
   pipe->remaining = 0;
 
-  musb_int_mask();
+  dcd_int_disable(rhport);
 
-  // volatile hw_endpoint_t *regs = edpt_regs(epn - 1);
   USBC_SelectActiveEp(epn);
   if (dir_in) {
     USBC_Writew(mps, USBC_REG_TXMAXP(USBC0_BASE));
@@ -1116,8 +1022,6 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc)
     reg_val = (1 << USBC_BP_TXCSR_D_MODE)
       | (1 << USBC_BP_TXCSR_D_FLUSH_FIFO)
       | (1 << USBC_BP_TXCSR_D_CLEAR_DATA_TOGGLE);
-    if  (xfer == TUSB_XFER_ISOCHRONOUS)
-      reg_val |= (1 << USBC_BP_TXCSR_D_ISO);
 	  USBC_Writew(reg_val, USBC_REG_TXCSR(USBC0_BASE));
 
     USBC_INT_EnableTxEp(epn);
@@ -1127,8 +1031,6 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc)
     _dcd.rx_held &= (uint16_t)~TU_BIT(epn - 1);
     reg_val = (1 << USBC_BP_RXCSR_D_FLUSH_FIFO)
       | (1 << USBC_BP_RXCSR_D_CLEAR_DATA_TOGGLE);
-    if  (xfer == TUSB_XFER_ISOCHRONOUS)
-      reg_val |= (1 << USBC_BP_RXCSR_D_ISO);
     USBC_Writew(reg_val, USBC_REG_RXCSR(USBC0_BASE));
 
     USBC_INT_EnableRxEp(epn);
@@ -1168,7 +1070,7 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc)
     USBC_Writeb(fifosz, USBC_REG_RXFIFOSZ(USBC0_BASE));
   }
 
-  musb_int_unmask();
+  dcd_int_enable(rhport);
 
   return true;
 }
@@ -1176,8 +1078,8 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc)
 void dcd_edpt_close_all(uint8_t rhport)
 {
   (void) rhport;
-  musb_int_mask();
-  for (unsigned ch = 0; ch < 2; ch++) if (dma_ch[ch].active) dma_stop(ch);
+  dcd_int_disable(rhport);
+  for (unsigned ch = 0; ch < TU_ARRAY_SIZE(dma_ch); ch++) if (dma_ch[ch].active) dma_stop(ch);
   USBC_Writew(1, USBC_REG_INTTxE(USBC0_BASE)); /* Enable only EP0 */
   USBC_Writew(0, USBC_REG_INTRxE(USBC0_BASE));
   _dcd.rx_held = 0;
@@ -1197,7 +1099,7 @@ void dcd_edpt_close_all(uint8_t rhport)
     USBC_Writew(0, USBC_REG_RXFIFOAD(USBC0_BASE));
     USBC_Writeb(0, USBC_REG_RXFIFOSZ(USBC0_BASE));
   }
-  musb_int_unmask();
+  dcd_int_enable(rhport);
 }
 
 void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr)
@@ -1206,7 +1108,7 @@ void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr)
   unsigned const epn    = tu_edpt_number(ep_addr);
   unsigned const dir_in = tu_edpt_dir(ep_addr);
 
-  musb_int_mask();
+  dcd_int_disable(rhport);
   USBC_SelectActiveEp(epn);
   if (dir_in) {
     USBC_INT_DisableTxEp(epn);
@@ -1227,23 +1129,8 @@ void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr)
     USBC_Writew(0, USBC_REG_RXFIFOAD(USBC0_BASE));
     USBC_Writeb(0, USBC_REG_RXFIFOSZ(USBC0_BASE));
   }
-  musb_int_unmask();
+  dcd_int_enable(rhport);
 }
-
-  #if 0
-bool dcd_edpt_iso_alloc(uint8_t rhport, uint8_t ep_addr, uint16_t largest_packet_size) {
-  (void)rhport;
-  (void)ep_addr;
-  (void)largest_packet_size;
-  return false;
-}
-
-bool dcd_edpt_iso_activate(uint8_t rhport, const tusb_desc_endpoint_t *desc_ep) {
-  (void)rhport;
-  (void)desc_ep;
-  return false;
-}
-  #endif
 
 // Submit a transfer, When complete dcd_event_xfer_complete() is invoked to notify the stack
 bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t total_bytes, bool is_isr)
@@ -1251,35 +1138,15 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t t
   (void) is_isr;
   (void)rhport;
   bool ret;
-  // TU_LOG1("X %x %d\r\n", ep_addr, total_bytes);
   unsigned const epnum = tu_edpt_number(ep_addr);
-  musb_int_mask();
+  dcd_int_disable(rhport);
 
   if (epnum) {
-    _dcd.pipe_buf_is_fifo[tu_edpt_dir(ep_addr)] &= ~TU_BIT(epnum - 1);
     ret = edpt_n_xfer(rhport, ep_addr, buffer, total_bytes);
   } else {
     ret = edpt0_xfer(rhport, ep_addr, buffer, total_bytes);
   }
-  musb_int_unmask();
-  return ret;
-}
-
-// Submit a transfer where is managed by FIFO, When complete dcd_event_xfer_complete() is invoked to notify the stack - optional, however, must be listed in usbd.c
-bool dcd_edpt_xfer_fifo(uint8_t rhport, uint8_t ep_addr, tu_fifo_t * ff, uint16_t total_bytes, bool is_isr)
-{
-  (void) is_isr;
-  (void)rhport;
-  bool ret;
-  // TU_LOG1("X %x %d\r\n", ep_addr, total_bytes);
-  unsigned const epnum = tu_edpt_number(ep_addr);
-  TU_ASSERT(epnum);
-
-  musb_int_mask();
-  _dcd.pipe_buf_is_fifo[tu_edpt_dir(ep_addr)] |= TU_BIT(epnum - 1);
-  ret = edpt_n_xfer(rhport, ep_addr, (uint8_t*)ff, total_bytes);
-  musb_int_unmask();
-
+  dcd_int_enable(rhport);
   return ret;
 }
 
@@ -1306,7 +1173,7 @@ void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr)
 {
   (void)rhport;
   unsigned const epn = tu_edpt_number(ep_addr);
-  musb_int_mask();
+  dcd_int_disable(rhport);
   USBC_SelectActiveEp(epn);
   if (0 == epn) {
     if (!ep_addr) { /* Ignore EP80 */
@@ -1323,7 +1190,7 @@ void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr)
       __USBC_Dev_Rx_SendStall();
     }
   }
-  musb_int_unmask();
+  dcd_int_enable(rhport);
 }
 
 // clear stall, data toggle is also reset to DATA0
@@ -1331,18 +1198,16 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr)
 {
   (void)rhport;
   unsigned const epn = tu_edpt_number(ep_addr);
-  musb_int_mask();
+  dcd_int_disable(rhport);
   USBC_SelectActiveEp(epn);
   if (0 != epn) {
     if (tu_edpt_dir(ep_addr)) { /* IN */
       __USBC_Dev_Tx_ClearStall();
-      USBC_REG_set_bit_w(USBC_BP_TXCSR_D_CLEAR_DATA_TOGGLE, USBC_REG_TXCSR(USBC0_BASE));
     } else { /* OUT */
       __USBC_Dev_Rx_ClearStall();
-      USBC_REG_set_bit_w(USBC_BP_RXCSR_D_CLEAR_DATA_TOGGLE, USBC_REG_RXCSR(USBC0_BASE));
     }
   }
-  musb_int_unmask();
+  dcd_int_enable(rhport);
 }
 
 
@@ -1357,7 +1222,7 @@ void dcd_int_handler(uint8_t rhport)
 
   /* H3 inner DMA channels (adb pair) */
   uint32_t dis = USBC_Readw(DMA_INTS);
-  for (unsigned ch = 0; ch < 2 && dis; ch++)
+  for (unsigned ch = 0; ch < TU_ARRAY_SIZE(dma_ch) && dis; ch++)
     if ((dis & (1u << ch)) && dma_ch[ch].active)
       handle_dma_done(rhport, ch);
   if (dis & ~3u) USBC_Writel(dis & ~3u, DMA_INTS);

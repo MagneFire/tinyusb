@@ -52,10 +52,6 @@ void dcd_h3_fifo_stats(uint32_t *rd_us_x10, uint32_t *rd_n, uint32_t *wr_us_x10,
 void dcd_h3_gap_stats(uint32_t **rx, uint32_t **tx);
 void dcd_h3_dma_stats(uint32_t *rx, uint32_t *tx, uint32_t *rx_short, uint32_t *tx_spin_us, uint32_t *bad);
 
-// Called from the ISR with the bytes received so far on an OUT transfer.
-// Weak, the default does nothing.
-void dcd_h3_out_progress(uint8_t ep_addr, uint32_t received);
-
 #ifdef __cplusplus
 }
 #endif
