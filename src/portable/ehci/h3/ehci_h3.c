@@ -560,7 +560,9 @@ TU_ATTR_ALWAYS_INLINE static inline
 void port_connect_status_change_isr(uint8_t rhport) {
   // NOTE There is an sequence plug->unplug->…..-> plug if device is powering with pre-plugged device
   if ( ehci_data.regs->portsc_bm.current_connect_status ) {
-    hcd_port_reset(rhport);
+    /* H3: no reset here; usbh resets after its attach debounce. A reset
+     * at connect drives SE0 while a Qualcomm boot ROM samples D+ for its
+     * forced-EDL "D+ grounded" check, and the watch boots into EDL. */
     hcd_event_device_attach(rhport, true);
   } else // device unplugged
   {
