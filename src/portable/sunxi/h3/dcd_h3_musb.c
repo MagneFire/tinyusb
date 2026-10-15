@@ -1166,6 +1166,10 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr)
   USBC_SelectActiveEp(epn);
   if (0 != epn) {
     if (tu_edpt_dir(ep_addr)) { /* IN */
+      /* usbd releases the endpoint on a clear, halted or not: a transfer
+       * still posted (a clear without a halt) must not leave its packet
+       * for the next transfer's host */
+      if (_dcd.in_armed & TU_BIT(epn - 1)) in_cancel(ep_addr);
       __USBC_Dev_Tx_ClearStall();
     } else { /* OUT */
       __USBC_Dev_Rx_ClearStall();
