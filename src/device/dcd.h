@@ -163,6 +163,10 @@ void dcd_edpt_stall           (uint8_t rhport, uint8_t ep_addr);
 // This API never calls with control endpoints, since it is auto cleared when receiving setup packet
 void dcd_edpt_clear_stall     (uint8_t rhport, uint8_t ep_addr);
 
+// Abort the transfer on a non-control endpoint without a halt: no STALL on the wire and the data
+// toggle kept. Returns false if the port cannot (the default) or the transfer already completed.
+bool dcd_edpt_abort_xfer      (uint8_t rhport, uint8_t ep_addr);
+
 #ifdef TUP_DCD_EDPT_CLOSE_API
 // Close an endpoint.
 void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr);

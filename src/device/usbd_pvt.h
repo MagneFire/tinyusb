@@ -97,6 +97,10 @@ bool usbd_edpt_stalled(uint8_t rhport, uint8_t ep_addr);
 // can be armed again
 void usbd_edpt_abort(uint8_t rhport, uint8_t ep_addr);
 
+// Abort an in-flight transfer without a halt (dcd_edpt_abort_xfer). No completion follows.
+// Returns false if the port cannot, or the transfer already completed and its completion follows.
+bool usbd_edpt_abort_xfer(uint8_t rhport, uint8_t ep_addr);
+
 // Allocate packet buffer used by ISO endpoints
 bool usbd_edpt_iso_alloc(uint8_t rhport, uint8_t ep_addr, uint16_t largest_packet_size);
 

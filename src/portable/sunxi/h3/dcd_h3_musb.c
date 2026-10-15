@@ -1157,6 +1157,21 @@ void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr)
   dcd_int_enable(rhport);
 }
 
+/* Cancel an IN transfer without a halt, keeping the data toggle. OUT is
+ * refused: its FIFO may already hold the next transfer's packet. */
+bool dcd_edpt_abort_xfer(uint8_t rhport, uint8_t ep_addr)
+{
+  unsigned const epn = tu_edpt_number(ep_addr);
+  if (0 == epn || !tu_edpt_dir(ep_addr)) return false;
+  dcd_int_disable(rhport);
+  USBC_SelectActiveEp(epn);
+  /* not armed: already complete, its completion event queued */
+  bool armed = _dcd.in_armed & TU_BIT(epn - 1);
+  if (armed) in_cancel(ep_addr);
+  dcd_int_enable(rhport);
+  return armed;
+}
+
 // clear stall, data toggle is also reset to DATA0
 void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr)
 {

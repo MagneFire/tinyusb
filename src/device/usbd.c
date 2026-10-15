@@ -30,6 +30,11 @@ TU_ATTR_WEAK void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_is
   (void) rhport; (void) eventid; (void) in_isr;
 }
 
+TU_ATTR_WEAK bool dcd_edpt_abort_xfer(uint8_t rhport, uint8_t ep_addr) {
+  (void) rhport; (void) ep_addr;
+  return false;
+}
+
 TU_ATTR_WEAK void tud_sof_cb(uint32_t frame_count) {
   (void) frame_count;
 }
@@ -1769,6 +1774,16 @@ void usbd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
 void usbd_edpt_abort(uint8_t rhport, uint8_t ep_addr) {
   usbd_edpt_stall(rhport, ep_addr);
   usbd_edpt_clear_stall(rhport, ep_addr);
+}
+
+bool usbd_edpt_abort_xfer(uint8_t rhport, uint8_t ep_addr) {
+  rhport = _usbd_rhport;
+  uint8_t const epnum = tu_edpt_number(ep_addr);
+  uint8_t const dir = tu_edpt_dir(ep_addr);
+  TU_VERIFY(epnum != 0);
+  TU_VERIFY(dcd_edpt_abort_xfer(rhport, ep_addr));
+  _usbd_dev.ep_status[epnum][dir] &= (uint8_t) ~(TU_EDPT_STATE_BUSY | TU_EDPT_STATE_CLAIMED);
+  return true;
 }
 
 bool usbd_edpt_stalled(uint8_t rhport, uint8_t ep_addr) {
