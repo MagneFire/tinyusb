@@ -1,9 +1,10 @@
 /* Forked from tinyusb 0.21.0 src/portable/ehci/ehci.c (MIT, Copyright (c)
  * 2019 Ha Thach) for the Allwinner H3's standard EHCI (usbproxy-bm). H3
- * changes: port speed derived from PORTSC (no NXP field), no NXP TT control
- * register, a busy-endpoint guard in hcd_edpt_xfer, and the companion
- * handover flag for the host manager; the NXP and HPM branches are gone.
- * Look for "H3". */
+ * changes: the hcd entry points are named ehci_h3_* so the board can share
+ * the port with the OHCI companion behind its own hcd_* layer, port speed
+ * derived from PORTSC (no NXP field), no NXP TT control register, a
+ * busy-endpoint guard in ehci_h3_edpt_xfer, the companion handover flag
+ * and the port event hook; the NXP and HPM branches are gone. Look for "H3". */
 /*
  * The MIT License (MIT)
  *
@@ -142,13 +143,13 @@ static void ehci_enable_schedule(ehci_registers_t* regs, bool is_period) {
 //--------------------------------------------------------------------+
 // HCD API
 //--------------------------------------------------------------------+
-uint32_t hcd_frame_number(uint8_t rhport) {
+uint32_t ehci_h3_frame_number(uint8_t rhport) {
   (void) rhport;
   uint32_t uframe = ehci_data.regs->frame_index;
   return (ehci_data.uframe_number + uframe) >> 3;
 }
 
-void hcd_port_reset(uint8_t rhport) {
+void ehci_h3_port_reset(uint8_t rhport) {
   (void) rhport;
 
   ehci_registers_t* regs = ehci_data.regs;
@@ -169,7 +170,7 @@ void hcd_port_reset(uint8_t rhport) {
   regs->portsc = portsc;
 }
 
-void hcd_port_reset_end(uint8_t rhport) {
+void ehci_h3_port_reset_end(uint8_t rhport) {
   (void) rhport;
   ehci_registers_t* regs = ehci_data.regs;
 
@@ -183,17 +184,16 @@ void hcd_port_reset_end(uint8_t rhport) {
   }
 }
 
-bool hcd_port_connect_status(uint8_t rhport) {
+bool ehci_h3_port_connect_status(uint8_t rhport) {
   (void) rhport;
   return ehci_data.regs->portsc_bm.current_connect_status;
 }
 
-tusb_speed_t hcd_port_speed_get(uint8_t rhport) {
+tusb_speed_t ehci_h3_port_speed_get(uint8_t rhport) {
   (void) rhport;
   /* H3: a standard EHCI has no port-speed field. After a reset the port is
    * enabled only for a high-speed device; a K line state means low speed;
-   * anything else is full speed (which this EHCI cannot serve without the
-   * OHCI companion, and the firmware never hands over). */
+   * anything else is full speed. Both belong to the OHCI companion. */
   ehci_registers_t* regs = ehci_data.regs;
   if (regs->portsc_bm.port_enabled) return TUSB_SPEED_HIGH;
   if (regs->portsc_bm.line_status == 1) return TUSB_SPEED_LOW;
@@ -201,7 +201,7 @@ tusb_speed_t hcd_port_speed_get(uint8_t rhport) {
 }
 
 // Close all opened endpoint belong to this device
-void hcd_device_close(uint8_t rhport, uint8_t daddr) {
+void ehci_h3_device_close(uint8_t rhport, uint8_t daddr) {
   // skip dev0
   if (daddr == 0) {
     return;
@@ -341,7 +341,7 @@ bool ehci_deinit(uint8_t rhport) {
 // Endpoint API
 //--------------------------------------------------------------------+
 
-bool hcd_edpt_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_endpoint_t const * ep_desc) {
+bool ehci_h3_edpt_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_endpoint_t const * ep_desc) {
   // TODO not support ISO yet
   TU_ASSERT (ep_desc->bmAttributes.xfer != TUSB_XFER_ISOCHRONOUS);
 
@@ -392,7 +392,7 @@ bool hcd_edpt_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_endpoint_t const 
   return true;
 }
 
-bool hcd_edpt_close(uint8_t rhport, uint8_t daddr, uint8_t ep_addr) {
+bool ehci_h3_edpt_close(uint8_t rhport, uint8_t daddr, uint8_t ep_addr) {
   ehci_qhd_t* qhd = qhd_get_from_addr(daddr, ep_addr);
   TU_VERIFY(qhd != NULL);
 
@@ -408,7 +408,7 @@ bool hcd_edpt_close(uint8_t rhport, uint8_t daddr, uint8_t ep_addr) {
   return true;
 }
 
-bool hcd_setup_send(uint8_t rhport, uint8_t dev_addr, uint8_t const setup_packet[8]) {
+bool ehci_h3_setup_send(uint8_t rhport, uint8_t dev_addr, uint8_t const setup_packet[8]) {
   (void) rhport;
 
   ehci_qhd_t* qhd = &ehci_data.control[dev_addr].qhd;
@@ -430,7 +430,7 @@ bool hcd_setup_send(uint8_t rhport, uint8_t dev_addr, uint8_t const setup_packet
   return true;
 }
 
-bool hcd_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t * buffer, uint16_t buflen) {
+bool ehci_h3_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t * buffer, uint16_t buflen) {
   (void) rhport;
 
   uint8_t const epnum = tu_edpt_number(ep_addr);
@@ -479,7 +479,7 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t * 
   return true;
 }
 
-bool hcd_edpt_abort_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr) {
+bool ehci_h3_edpt_abort_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr) {
   (void) rhport;
 
   // TODO ISO not supported yet
@@ -517,7 +517,7 @@ bool hcd_edpt_abort_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr) {
   return still_active; // true if removed an active transfer
 }
 
-bool hcd_edpt_clear_stall(uint8_t rhport, uint8_t daddr, uint8_t ep_addr) {
+bool ehci_h3_edpt_clear_stall(uint8_t rhport, uint8_t daddr, uint8_t ep_addr) {
   (void) rhport;
   ehci_qhd_t *qhd = qhd_get_from_addr(daddr, ep_addr);
   TU_VERIFY(qhd != NULL);
@@ -558,20 +558,22 @@ void async_advance_isr(uint8_t rhport) {
 
 TU_ATTR_ALWAYS_INLINE static inline
 void port_connect_status_change_isr(uint8_t rhport) {
+  (void) rhport;
   // NOTE There is an sequence plug->unplug->…..-> plug if device is powering with pre-plugged device
   if ( ehci_data.regs->portsc_bm.current_connect_status ) {
     /* H3: no reset here; usbh resets after its attach debounce. A reset
      * at connect drives SE0 while a Qualcomm boot ROM samples D+ for its
-     * forced-EDL "D+ grounded" check, and the watch boots into EDL. */
-    hcd_event_device_attach(rhport, true);
+     * forced-EDL "D+ grounded" check, and the watch boots into EDL. The
+     * board's hook posts the attach, or drops it while the OHCI owns the
+     * port. */
+    ehci_h3_port_changed(true, true);
   } else // device unplugged
   {
     /* H3: with CONFIGFLAG set and the OHCI companion present, the HC hands a
      * port to the companion (PortOwner) when a reset ends without the device
-     * enabling high speed, which the firmware sees as a disconnect. The host
-     * manager takes the port back after a delay. */
+     * enabling high speed, which this controller sees as a disconnect. */
     ehci_h3_port_handed_over = ehci_data.regs->portsc_bm.port_owner;
-    hcd_event_device_remove(rhport, true);
+    ehci_h3_port_changed(false, true);
   }
 }
 
@@ -715,7 +717,7 @@ void ehci_h3_poll_async(uint8_t rhport) {
 }
 
 //------------- Host Controller Driver's Interrupt Handler -------------//
-void hcd_int_handler(uint8_t rhport, bool in_isr) {
+void ehci_h3_int_handler(uint8_t rhport, bool in_isr) {
   (void) in_isr;
   ehci_registers_t* regs = ehci_data.regs;
   uint32_t const int_status = regs->status;
