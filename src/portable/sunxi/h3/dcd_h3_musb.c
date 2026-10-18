@@ -842,6 +842,11 @@ static void process_edpt_n(uint8_t rhport, uint_fast8_t ep_addr)
   }
 }
 
+/* H3: the gadget's speed and FIFO placement follow its shape (dcd_h3.h). */
+static bool h3_high_speed = true;
+static bool h3_fifo_dynamic;
+static unsigned h3_fifo_next;
+
 static void process_bus_reset(uint8_t rhport)
 {
   /* When bmRequestType is REQUEST_TYPE_INVALID(0xFF),
@@ -858,6 +863,7 @@ static void process_bus_reset(uint8_t rhport)
   _dcd.in_zlp_pending = 0;
   _dcd.rx_held = 0;
   _dcd.in_armed = 0;
+  h3_fifo_next = 64;    /* the endpoints are opened again after the reset */
 
   USBC_Writew(1, USBC_REG_INTTxE(USBC0_BASE)); /* Enable only EP0 */
   USBC_Writew(0, USBC_REG_INTRxE(USBC0_BASE));
@@ -873,6 +879,15 @@ void dcd_h3_dpb_stats(uint32_t *rx_extra, uint32_t *tx_busy)
 {
   *rx_extra = _dcd.dpb_rx_extra; *tx_busy = _dcd.tx_busy_irqs;
 }
+void dcd_h3_set_high_speed(bool on)
+{
+  h3_high_speed = on;
+  if (on) USBC_REG_set_bit_b(USBC_BP_POWER_D_HIGH_SPEED_EN, USBC_REG_PCTL(USBC0_BASE));
+  else USBC_REG_clear_bit_b(USBC_BP_POWER_D_HIGH_SPEED_EN, USBC_REG_PCTL(USBC0_BASE));
+}
+
+void dcd_h3_fifo_mode(bool dynamic) { h3_fifo_dynamic = dynamic; }
+
 bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
   (void) rh_init;
 
@@ -886,7 +901,7 @@ bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
   USBC_Writeb(0, USBC_REG_VEND0(USBC0_BASE)); /* PIO, no DMA request */
   dcd_edpt_close_all(rhport);
 
-  USBC_REG_set_bit_b(USBC_BP_POWER_D_HIGH_SPEED_EN, USBC_REG_PCTL(USBC0_BASE));
+  dcd_h3_set_high_speed(h3_high_speed);
 
   /* No SOF interrupt by default; dcd_sof_enable() or dcd_h3_sof_irq()
    * turns it on. */
@@ -1020,11 +1035,33 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const * ep_desc)
     { {0, 0, 0},      {64, 3, 0}   },   /* ep3 CDC notify (IN only, 64) */
     { {4096, 6, 0},   {512, 6, 0}  },   /* ep4 CDC data */
   };
-  TU_ASSERT(mps <= (8u << fifo_map[epn][dir_in].code));
-  bool dpb = fifo_map[epn][dir_in].dpb;
-  unsigned addr = fifo_map[epn][dir_in].addr / 8;
-  TU_ASSERT(addr);
-  uint8_t fifosz = (uint8_t)(fifo_map[epn][dir_in].code | (dpb ? USB_TXFIFOSZ_DPB : 0));
+  unsigned addr, code;
+  bool dpb;
+  if (h3_fifo_dynamic) {
+    /* H3: any endpoint set (a mirrored device): size-aligned bump allocation
+     * behind ep0's 64 bytes, reset by dcd_edpt_close_all(). OUT is double
+     * buffered while the RAM allows, IN never (see above). */
+    for (code = 0; (8u << code) < mps; code++) {}
+    unsigned size = 8u << code;
+    dpb = !dir_in;
+    unsigned alloc = dpb ? 2 * size : size;
+    unsigned at = (h3_fifo_next + alloc - 1) & ~(alloc - 1);
+    if (dpb && at + alloc > 8192) {
+      dpb = false;
+      alloc = size;
+      at = (h3_fifo_next + alloc - 1) & ~(alloc - 1);
+    }
+    TU_ASSERT(at + alloc <= 8192);
+    h3_fifo_next = at + alloc;
+    addr = at / 8;
+  } else {
+    TU_ASSERT(mps <= (8u << fifo_map[epn][dir_in].code));
+    code = fifo_map[epn][dir_in].code;
+    dpb = fifo_map[epn][dir_in].dpb;
+    addr = fifo_map[epn][dir_in].addr / 8;
+    TU_ASSERT(addr);
+  }
+  uint8_t fifosz = (uint8_t)(code | (dpb ? USB_TXFIFOSZ_DPB : 0));
 
   if (dir_in) {
     USBC_Writew(addr, USBC_REG_TXFIFOAD(USBC0_BASE));
@@ -1048,6 +1085,7 @@ void dcd_edpt_close_all(uint8_t rhport)
   USBC_Writew(0, USBC_REG_INTRxE(USBC0_BASE));
   _dcd.rx_held = 0;
   _dcd.in_armed = 0;
+  h3_fifo_next = 64;
   for (unsigned i = 1; i < TUP_DCD_ENDPOINT_MAX; ++i) {
     USBC_SelectActiveEp(i);
     USBC_Writew(0, USBC_REG_TXMAXP(USBC0_BASE));

@@ -47,6 +47,16 @@ uint32_t dcd_h3_dma_enabled(void);
 // SOF interrupt on or off.
 void dcd_h3_sof_irq(bool on);
 
+// High speed offered at the next bus reset (default on); call before
+// dcd_connect(). A full-speed-only shape presents a full/low-speed device's
+// endpoints as they are.
+void dcd_h3_set_high_speed(bool on);
+
+// FIFO placement for the endpoints opened next: the board's static map
+// (default), or size-aligned allocation in order of opening for any
+// endpoint set. Takes effect at the next dcd_edpt_close_all().
+void dcd_h3_fifo_mode(bool dynamic);
+
 // RX packets drained behind the first (DPB), TX interrupts with TXPKTRDY
 // still set.
 void dcd_h3_dpb_stats(uint32_t *rx_extra, uint32_t *tx_busy);
