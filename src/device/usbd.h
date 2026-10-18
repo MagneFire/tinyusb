@@ -130,6 +130,10 @@ bool tud_control_xfer(uint8_t rhport, tusb_control_request_t const * request, vo
 // Send STATUS (zero length) packet
 bool tud_control_status(uint8_t rhport, tusb_control_request_t const * request);
 
+// H3: hold back the status stage of an OUT data transfer; finish later with
+// tud_control_status() or a stall of EP0 (see usbd.c).
+void tud_control_status_defer(uint8_t rhport);
+
 //--------------------------------------------------------------------+
 // Application Callbacks
 //--------------------------------------------------------------------+

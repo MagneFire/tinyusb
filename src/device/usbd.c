@@ -110,6 +110,7 @@ typedef struct {
   uint16_t data_len;
   uint16_t total_xferred;
   usbd_control_xfer_cb_t complete_cb;
+  bool status_deferred; // H3: the class driver finishes the status stage itself
 } usbd_control_xfer_t;
 
 typedef struct {
@@ -896,6 +897,15 @@ static bool data_stage_xact(uint8_t rhport) {
   return usbd_edpt_xfer(rhport, ep_addr, xact_len ? _ctrl_epbuf.buf : NULL, xact_len, false);
 }
 
+/* H3: hold back the status stage of an OUT data transfer. Called from the
+ * class driver's CONTROL_STAGE_DATA callback; the driver later finishes
+ * with tud_control_status() or stalls EP0 (a proxy waits for the device
+ * behind it). */
+void tud_control_status_defer(uint8_t rhport) {
+  (void) rhport;
+  _usbd_dev.ctrl_xfer.status_deferred = true;
+}
+
 // Status phase
 bool tud_control_status(uint8_t rhport, const tusb_control_request_t* request) {
   // _usbd_dev.ctrl_xfer fields are pre-initialized at process_setup_received entry
@@ -969,7 +979,10 @@ static bool usbd_control_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t 
     }
 
     if (is_ok) {
-      TU_VERIFY(status_stage_xact(rhport, ep_status));
+      // H3: a deferred status stage is the driver's (tud_control_status_defer)
+      if (!ctrl_xfer->status_deferred) {
+        TU_VERIFY(status_stage_xact(rhport, ep_status));
+      }
     } else {
       // Stall both IN and OUT control endpoint
       dcd_edpt_stall(rhport, TU_EP0_OUT);
@@ -1122,6 +1135,7 @@ static bool process_setup_received(uint8_t rhport, tusb_control_request_t const 
   ctrl_xfer->total_xferred = 0;
   ctrl_xfer->data_len = 0;
   ctrl_xfer->complete_cb = NULL;
+  ctrl_xfer->status_deferred = false;
 
   p_request = &ctrl_xfer->request; // re-direct request pointer to internal copy (modifiable for hacking)
   TU_ASSERT(p_request->bmRequestType_bit.type < TUSB_REQ_TYPE_INVALID);
