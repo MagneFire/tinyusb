@@ -355,6 +355,7 @@ static void process_setup_packet(uint8_t rhport)
   p[1]        = USBC_Readl(USBC_REG_EPFIFO0(USBC0_BASE));
 
   pipe0_reset();
+  _dcd.status_out = 0;  /* H3: a new control transfer, whatever the last one left */
   dcd_event_setup_received(rhport, (const uint8_t*)(uintptr_t)&_dcd.setup_packet, true);
 
   const unsigned len    = _dcd.setup_packet.wLength;
@@ -705,14 +706,18 @@ static bool edpt0_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_
     if (dir_in) {
       pipe_write_packet(buffer, (volatile void*) USBC_REG_EPFIFO0(USBC0_BASE), len);
 
-      _dcd.pipe0.buf       = buffer + len;
+      /* H3: an IN request without data (wLength 0) has no data stage; this
+       * ZLP is its status stage. It completes like a data packet (the
+       * marker keeps the completion path), and no status OUT follows. */
+      const bool no_data = (rem == 0 && len == 0);
+      _dcd.pipe0.buf       = no_data ? (uint8_t*)(uintptr_t)&_dcd.setup_packet : buffer + len;
       _dcd.pipe0.length    = len;
       _dcd.pipe0.remaining = 0;
 
       _dcd.remaining_ctrl  = rem - len;
       if ((len < 64) || (rem == len)) {
         _dcd.setup_packet.bmRequestType = REQUEST_TYPE_INVALID; /* Change to STATUS/SETUP stage */
-        _dcd.status_out = 1;
+        _dcd.status_out = !no_data;
         /* Flush TX FIFO and reverse the transaction direction. */
         __USBC_Dev_ep0_WriteDataComplete();
       } else {
